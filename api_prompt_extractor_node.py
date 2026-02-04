@@ -76,7 +76,6 @@ class APIPromptExtractorSDXL:
                 "image": ("IMAGE",),
                 "llm_model": ("STRING", {"default": "gpt-5-mini"}),
                 "max_output_tokens": ("INT", {"default": 160, "min": 32, "max": 2048}),
-                "temperature": ("FLOAT", {"default": 0.2, "min": 0.0, "max": 2.0}),
                 "jpeg_quality": ("INT", {"default": 90, "min": 30, "max": 95}),
             }
         }
@@ -86,7 +85,6 @@ class APIPromptExtractorSDXL:
         image,
         llm_model: str,
         max_output_tokens: int,
-        temperature: float,
         jpeg_quality: int,
     ) -> Tuple[str]:
         # Soft-fail only — never crash the graph
@@ -122,7 +120,6 @@ class APIPromptExtractorSDXL:
                     }
                 ],
                 max_output_tokens=int(max_output_tokens),
-                temperature=float(temperature),
             )
 
             raw = getattr(response, "output_text", "") or ""
