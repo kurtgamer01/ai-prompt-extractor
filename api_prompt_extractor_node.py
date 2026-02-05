@@ -57,6 +57,50 @@ def _comfy_image_to_jpeg_base64(image_tensor, quality: int = 90) -> str:
 def _normalize_whitespace(text: str) -> str:
     return " ".join(text.strip().split())
 
+def _extract_output_text(resp) -> str:
+    # Prefer convenience field if present and non-empty
+    t = getattr(resp, "output_text", None)
+    if isinstance(t, str) and t.strip():
+        return t.strip()
+
+    # Fall back to parsing resp.output
+    out = getattr(resp, "output", None)
+    texts = []
+
+    if out:
+        for item in out:
+            # item may be dict-like or object-like
+            if isinstance(item, dict):
+                content = item.get("content")
+            else:
+                content = getattr(item, "content", None)
+
+            if not content:
+                continue
+
+            for block in content:
+                if isinstance(block, dict):
+                    btype = block.get("type")
+                else:
+                    btype = getattr(block, "type", None)
+
+                if btype == "output_text":
+                    if isinstance(block, dict):
+                        txt = block.get("text", "")
+                    else:
+                        txt = getattr(block, "text", "")
+                    if txt:
+                        texts.append(txt)
+
+                elif btype == "refusal":
+                    if isinstance(block, dict):
+                        txt = block.get("refusal", "")
+                    else:
+                        txt = getattr(block, "refusal", "")
+                    if txt:
+                        texts.append(f"[REFUSAL] {txt}")
+
+    return "\n".join(texts).strip()
 
 class APIPromptExtractorSDXL:
     """
@@ -75,15 +119,18 @@ class APIPromptExtractorSDXL:
             "required": {
                 "image": ("IMAGE",),
                 "llm_model": ("STRING", {"default": "gpt-5-mini"}),
-                "max_output_tokens": ("INT", {"default": 160, "min": 32, "max": 2048}),
+                "max_output_tokens": ("INT", {"default": 512, "min": 32, "max": 2048}),
                 "jpeg_quality": ("INT", {"default": 90, "min": 30, "max": 95}),
             }
         }
 
+
+    
+    
     def run(
-        self,
-        image,
-        llm_model: str,
+            self,
+            image,
+            llm_model: str,
         max_output_tokens: int,
         jpeg_quality: int,
     ) -> Tuple[str]:
@@ -119,11 +166,27 @@ class APIPromptExtractorSDXL:
                         ],
                     }
                 ],
+                text={"format": {"type": "text"}},
+                reasoning={"effort": "low"},
                 max_output_tokens=int(max_output_tokens),
             )
 
-            raw = getattr(response, "output_text", "") or ""
+            try:
+                print("[APIPromptExtractorSDXL] output_text:", repr(getattr(response, "output_text", None)))
+                print("[APIPromptExtractorSDXL] output:", getattr(response, "output", None))
+            except Exception as _:
+                pass
+
+            raw = _extract_output_text(response)
+            if not raw:
+                 print("[APIPromptExtractorSDXL] EMPTY TEXT OUTPUT. Full response dump follows:")
+                 try:
+                     print(response.model_dump())
+                 except Exception:
+                     print(response)
+                 return ("[APIPromptExtractorSDXL] Empty model text output (see console).",)
             return (_normalize_whitespace(raw),)
+
 
         except Exception as e:
             print(f"[APIPromptExtractorSDXL] API call failed: {e}")
