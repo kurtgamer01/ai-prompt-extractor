@@ -1,6 +1,7 @@
 import base64
 import io
 import os
+import json
 from typing import Tuple
 
 import numpy as np
@@ -102,6 +103,136 @@ def _extract_output_text(resp) -> str:
 
     return "\n".join(texts).strip()
 
+SECTION_KEYS = [
+    "subject_scene",
+    "style",
+    "clothing_accessories",
+    "pose_orientation",
+    "expression_gaze",
+    "lighting",
+    "camera_framing",
+]
+
+ALL_JSON_KEYS = SECTION_KEYS + ["negative"]
+
+DEFAULT_SECTION_ORDER = ",".join(SECTION_KEYS)
+
+def _empty_fields_dict() -> dict:
+    return {k: "" for k in ALL_JSON_KEYS}
+
+def _build_json_directive_7(
+    include_subject_scene: bool,
+    include_style: bool,
+    include_clothing_accessories: bool,
+    include_pose_orientation: bool,
+    include_expression_gaze: bool,
+    include_lighting: bool,
+    include_camera_framing: bool,
+) -> str:
+    enabled = []
+    if include_subject_scene: enabled.append("subject_scene")
+    if include_style: enabled.append("style")
+    if include_clothing_accessories: enabled.append("clothing_accessories")
+    if include_pose_orientation: enabled.append("pose_orientation")
+    if include_expression_gaze: enabled.append("expression_gaze")
+    if include_lighting: enabled.append("lighting")
+    if include_camera_framing: enabled.append("camera_framing")
+
+    enabled_csv = ", ".join(enabled) if enabled else "none"
+
+    schema = _empty_fields_dict()
+
+    return (
+        "Return ONLY valid JSON (no markdown, no code fences, no commentary).\n"
+        f"JSON schema (keys must match exactly): {json.dumps(schema)}\n"
+        f"Enabled sections: {enabled_csv}\n"
+        "Hard rules:\n"
+        "- Return ONLY the enabled section keys.\n"
+        "- Do NOT include disabled section keys at all.\n"
+        "- Do NOT include any information that belongs to a disabled section.\n"
+        "- Do NOT infer or invent details; if unsure, omit the field.\n"
+        "- Output the JSON on a single line with no extra whitespace.\n"
+    )
+
+def _safe_parse_json_object(text: str) -> dict:
+    if not isinstance(text, str):
+        return {}
+    s = text.strip()
+    if not s:
+        return {}
+
+    # direct parse
+    try:
+        obj = json.loads(s)
+        return obj if isinstance(obj, dict) else {}
+    except Exception:
+        pass
+
+    # fallback: extract first {...}
+    l = s.find("{")
+    r = s.rfind("}")
+    if l != -1 and r != -1 and r > l:
+        try:
+            obj = json.loads(s[l:r+1])
+            return obj if isinstance(obj, dict) else {}
+        except Exception:
+            return {}
+
+    return {}
+
+def _guard_and_blank_fields(
+    obj: dict,
+    include_subject_scene: bool,
+    include_style: bool,
+    include_clothing_accessories: bool,
+    include_pose_orientation: bool,
+    include_expression_gaze: bool,
+    include_lighting: bool,
+    include_camera_framing: bool,
+) -> dict:
+    out = _empty_fields_dict()
+
+    if isinstance(obj, dict):
+        for k in ALL_JSON_KEYS:
+            v = obj.get(k, "")
+            out[k] = v if isinstance(v, str) else ""
+
+    if not include_subject_scene: out["subject_scene"] = ""
+    if not include_style: out["style"] = ""
+    if not include_clothing_accessories: out["clothing_accessories"] = ""
+    if not include_pose_orientation: out["pose_orientation"] = ""
+    if not include_expression_gaze: out["expression_gaze"] = ""
+    if not include_lighting: out["lighting"] = ""
+    if not include_camera_framing: out["camera_framing"] = ""
+
+    return out
+
+
+def _parse_section_order(order: str) -> list:
+    allowed = set(SECTION_KEYS)
+    seen = set()
+    out = []
+    for part in (order or "").split(","):
+        k = part.strip()
+        if not k:
+            continue
+        k = k.lower()
+        if k in allowed and k not in seen:
+            out.append(k)
+            seen.add(k)
+
+    return out if out else list(SECTION_KEYS)
+
+
+def _combine_sections(fields: dict, order: list) -> str:
+    parts = []
+    for k in order:
+        v = (fields.get(k, "") or "").strip()
+        if v:
+            parts.append(v)
+    return ", ".join(parts)
+
+
 class APIPromptExtractorSDXL:
     """
     IMAGE -> STRING
@@ -121,18 +252,35 @@ class APIPromptExtractorSDXL:
                 "llm_model": ("STRING", {"default": "gpt-5-mini"}),
                 "max_output_tokens": ("INT", {"default": 512, "min": 32, "max": 2048}),
                 "jpeg_quality": ("INT", {"default": 90, "min": 30, "max": 95}),
+
+                # Section toggles (match SECTION_KEYS exactly)
+                "include_subject_scene": ("BOOLEAN", {"default": True}),
+                "include_style": ("BOOLEAN", {"default": True}),
+                "include_clothing_accessories": ("BOOLEAN", {"default": True}),
+                "include_pose_orientation": ("BOOLEAN", {"default": True}),
+                "include_expression_gaze": ("BOOLEAN", {"default": True}),
+                "include_lighting": ("BOOLEAN", {"default": True}),
+                "include_camera_framing": ("BOOLEAN", {"default": True}),
+
+                # User-controlled order (CSV, snake_case keys)
+                "section_order": ("STRING", {"default": DEFAULT_SECTION_ORDER}),
             }
         }
-
-
-    
     
     def run(
             self,
             image,
             llm_model: str,
-        max_output_tokens: int,
-        jpeg_quality: int,
+            max_output_tokens: int,
+            jpeg_quality: int,
+            include_subject_scene: bool,
+            include_style: bool,
+            include_clothing_accessories: bool,
+            include_pose_orientation: bool,
+            include_expression_gaze: bool,
+            include_lighting: bool,
+            include_camera_framing: bool,
+            section_order: str,
     ) -> Tuple[str]:
         # Soft-fail only — never crash the graph
         if OpenAI is None:
@@ -153,6 +301,16 @@ class APIPromptExtractorSDXL:
             instructions = _load_instructions(INSTRUCTIONS_PATH)
             if not instructions:
                 return ("",)
+            
+            instructions = instructions + "\n\n" + _build_json_directive_7(
+                include_subject_scene=include_subject_scene,
+                include_style=include_style,
+                include_clothing_accessories=include_clothing_accessories,
+                include_pose_orientation=include_pose_orientation,
+                include_expression_gaze=include_expression_gaze,
+                include_lighting=include_lighting,
+                include_camera_framing=include_camera_framing,
+            )
 
             response = client.responses.create(
                 model=llm_model,
@@ -161,31 +319,53 @@ class APIPromptExtractorSDXL:
                     {
                         "role": "user",
                         "content": [
-                            {"type": "input_text", "text": "Generate an SDXL prompt from this image."},
+                            {"type": "input_text", "text": "Generate an SDXL prompt from this image and return it as JSON per the instructions."},
                             {"type": "input_image", "image_url": data_url},
                         ],
                     }
                 ],
-                text={"format": {"type": "text"}},
+                text={"format": {"type": "json_object"}},
                 reasoning={"effort": "low"},
                 max_output_tokens=int(max_output_tokens),
             )
 
             try:
                 print("[APIPromptExtractorSDXL] output_text:", repr(getattr(response, "output_text", None)))
-                print("[APIPromptExtractorSDXL] output:", getattr(response, "output", None))
+                #print("[APIPromptExtractorSDXL] output:", getattr(response, "output", None))
             except Exception as _:
                 pass
 
             raw = _extract_output_text(response)
             if not raw:
-                 print("[APIPromptExtractorSDXL] EMPTY TEXT OUTPUT. Full response dump follows:")
-                 try:
-                     print(response.model_dump())
-                 except Exception:
-                     print(response)
-                 return ("[APIPromptExtractorSDXL] Empty model text output (see console).",)
-            return (_normalize_whitespace(raw),)
+                print("[APIPromptExtractorSDXL] EMPTY TEXT OUTPUT. Full response dump follows:")
+                try:
+                    print(response.model_dump())
+                except Exception:
+                    print(response)
+                return ("[APIPromptExtractorSDXL] Empty model text output (see console).",)
+
+            obj = _safe_parse_json_object(raw)
+            if not obj:
+                print("[APIPromptExtractorSDXL] Failed to parse JSON. Raw output follows:")
+                print(repr(raw))
+                return ("[APIPromptExtractorSDXL] Invalid JSON output (see console).",)
+
+            fields = _guard_and_blank_fields(
+                obj,
+                include_subject_scene=include_subject_scene,
+                include_style=include_style,
+                include_clothing_accessories=include_clothing_accessories,
+                include_pose_orientation=include_pose_orientation,
+                include_expression_gaze=include_expression_gaze,
+                include_lighting=include_lighting,
+                include_camera_framing=include_camera_framing,
+            )
+
+            order = _parse_section_order(section_order)
+            combined = _combine_sections(fields, order)
+
+            return (_normalize_whitespace(combined),)
+
 
 
         except Exception as e:
