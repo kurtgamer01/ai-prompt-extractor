@@ -15,6 +15,66 @@ except Exception as e:
     OpenAI = None
     _openai_import_error = e
 
+# ---- LLM provider/model registry (canonical IDs: "provider:model") ----
+
+LLM_PROVIDERS = {
+    # OpenAI
+    "openai": {
+        "env_key": "OPENAI_API_KEY",
+        "base_url_env": "OPENAI_BASE_URL",      # optional override
+        "default_base_url": "",                 # empty = use SDK default
+        "models": [
+            "gpt-5-mini",
+            "gpt-5",
+        ],
+    },
+    # xAI / Grok (OpenAI-compatible API)
+    "xai": {
+        "env_key": "XAI_API_KEY",
+        "base_url_env": "XAI_BASE_URL",         # optional override
+        "default_base_url": "https://api.x.ai/v1",
+        "models": [
+            # Add Grok Models here
+            "grok-4-1-fast-reasoning",
+            "grok-4-1-fast-non-reasoning",
+        ],
+    },
+    # Placeholder for future local routing (node can soft-fail for now)
+    "local": {
+        "env_key": "",
+        "base_url_env": "",
+        "default_base_url": "",
+        "models": [
+            "llava",
+        ],
+    },
+}
+
+
+def _llm_model_choices() -> list:
+    choices = []
+    for provider, cfg in LLM_PROVIDERS.items():
+        for model in cfg.get("models", []):
+            choices.append(f"{provider}:{model}")
+    return sorted(choices)
+
+
+def _parse_llm_model_id(llm_model: str) -> Tuple[str, str]:
+    """
+    Accepts:
+      - "provider:model" (preferred)
+      - "model" (legacy/back-compat; assumed openai)
+    """
+    s = (llm_model or "").strip()
+    if ":" in s:
+        provider, model = s.split(":", 1)
+        return provider.strip().lower(), model.strip()
+    return "openai", s
+
+
+def _get_provider_cfg(provider: str) -> dict:
+    return LLM_PROVIDERS.get((provider or "").strip().lower(), {})
+
 def _list_rule_files() -> list:
     try:
         files = [
@@ -299,7 +359,7 @@ class APIPromptExtractorSDXL:
         return {
             "required": {
                 "image": ("IMAGE",),
-                "llm_model": ("STRING", {"default": "gpt-5-mini"}),
+                "llm_model": (_llm_model_choices(), {"default": "openai:gpt-5-mini"}),
                 "rules_file": (_list_rule_files(), {"default": "sdxl_prompt_instructions.txt"}),
                 "max_output_tokens": ("INT", {"default": 2048, "min": 32, "max": 5096}),
                 "jpeg_quality": ("INT", {"default": 90, "min": 30, "max": 95}),
@@ -378,16 +438,37 @@ class APIPromptExtractorSDXL:
             print(f"[APIPromptExtractorSDXL] openai import failed: {_openai_import_error}")
             return ("", "")
 
-        api_key = os.getenv("OPENAI_API_KEY", "").strip()
-        if not api_key:
-            print("[APIPromptExtractorSDXL] OPENAI_API_KEY not set")
+        provider, model_name = _parse_llm_model_id(llm_model)
+        cfg = _get_provider_cfg(provider)
+        if not cfg:
+            print(f"[APIPromptExtractorSDXL] Unknown provider: {provider}")
             return ("", "")
+
+        # If you later implement local routing, replace this soft-fail
+        if provider == "local":
+            print("[APIPromptExtractorSDXL] provider=local not implemented in this node yet")
+            return ("", "")
+
+        env_key = (cfg.get("env_key") or "").strip()
+        api_key = os.getenv(env_key, "").strip() if env_key else ""
+        if not api_key:
+            print(f"[APIPromptExtractorSDXL] {env_key} not set for provider={provider}")
+            return ("", "")
+
+        # Optional base_url override per provider (lets you swap endpoints without code changes)
+        base_url_env = (cfg.get("base_url_env") or "").strip()
+        base_url = (os.getenv(base_url_env, "").strip() if base_url_env else "") or (cfg.get("default_base_url") or "").strip()
 
         try:
             b64 = _comfy_image_to_jpeg_base64(image, quality=jpeg_quality)
             data_url = f"data:image/jpeg;base64,{b64}"
 
-            client = OpenAI(api_key=api_key)
+            # OpenAI SDK supports base_url; if empty, use default
+            if base_url:
+                client = OpenAI(api_key=api_key, base_url=base_url)
+            else:
+                client = OpenAI(api_key=api_key)
+
 
             rules_path = os.path.join(RULES_DIR, (rules_file or "").strip())
 
@@ -411,8 +492,8 @@ class APIPromptExtractorSDXL:
                 include_camera_framing=include_camera_framing,
             )
 
-            response = client.responses.create(
-                model=llm_model,
+            req_kwargs = dict(
+                model=model_name,
                 instructions=instructions,
                 input=[
                     {
@@ -424,9 +505,14 @@ class APIPromptExtractorSDXL:
                     }
                 ],
                 text={"format": {"type": "json_object"}},
-                reasoning={"effort": "low"},
                 max_output_tokens=int(max_output_tokens),
             )
+
+            # OpenAI supports this; Grok (xAI) is rejecting it
+            if provider == "openai":
+                req_kwargs["reasoning"] = {"effort": "low"}
+
+            response = client.responses.create(**req_kwargs)
 
             try:
                 print("[APIPromptExtractorSDXL] output_text:", repr(getattr(response, "output_text", None)))
