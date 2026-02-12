@@ -7,18 +7,25 @@ from typing import Tuple
 import numpy as np
 from PIL import Image
 
-INSTRUCTIONS_PATH = os.path.join(
-    os.path.dirname(__file__),
-    "rules",
-    "sdxl_prompt_instructions.txt"
-)
-
+RULES_DIR = os.path.join(os.path.dirname(__file__), "rules")
 
 try:
     from openai import OpenAI
 except Exception as e:
     OpenAI = None
     _openai_import_error = e
+
+def _list_rule_files() -> list:
+    try:
+        files = [
+            f for f in os.listdir(RULES_DIR)
+            if os.path.isfile(os.path.join(RULES_DIR, f)) and f.lower().endswith(".txt")
+        ]
+        files.sort()
+        return files if files else ["sdxl_prompt_instructions.txt"]
+    except Exception as e:
+        print(f"[APIPromptExtractorSDXL] Failed to list rules dir: {e}")
+        return ["sdxl_prompt_instructions.txt"]
 
 def _load_instructions(path: str) -> str:
     try:
@@ -103,8 +110,27 @@ def _extract_output_text(resp) -> str:
 
     return "\n".join(texts).strip()
 
+def _apply_override(enabled: bool, extracted: str, override: str) -> str:
+    if enabled:
+        return (extracted or "").strip()
+    return (override or "").strip()
+
+SENTENCE_CHUNK_ORDER = [
+    "subject",
+    "scene",
+    "clothing_accessories",
+    "pose_orientation",
+    "expression_gaze",
+    "lighting",
+    "camera_framing",
+    "style",
+    "misc1",
+    "misc2",
+]
+
 SECTION_KEYS = [
-    "subject_scene",
+    "subject",
+    "scene",
     "style",
     "clothing_accessories",
     "pose_orientation",
@@ -113,6 +139,8 @@ SECTION_KEYS = [
     "camera_framing",
 ]
 
+MISC_KEYS = ["misc1", "misc2"]
+
 ALL_JSON_KEYS = SECTION_KEYS + ["negative"]
 
 DEFAULT_SECTION_ORDER = ",".join(SECTION_KEYS)
@@ -120,8 +148,9 @@ DEFAULT_SECTION_ORDER = ",".join(SECTION_KEYS)
 def _empty_fields_dict() -> dict:
     return {k: "" for k in ALL_JSON_KEYS}
 
-def _build_json_directive_7(
-    include_subject_scene: bool,
+def _build_json_directive_8(
+    include_subject: bool,
+    include_scene: bool,
     include_style: bool,
     include_clothing_accessories: bool,
     include_pose_orientation: bool,
@@ -130,7 +159,8 @@ def _build_json_directive_7(
     include_camera_framing: bool,
 ) -> str:
     enabled = []
-    if include_subject_scene: enabled.append("subject_scene")
+    if include_subject: enabled.append("subject")
+    if include_scene: enabled.append("scene")
     if include_style: enabled.append("style")
     if include_clothing_accessories: enabled.append("clothing_accessories")
     if include_pose_orientation: enabled.append("pose_orientation")
@@ -139,7 +169,6 @@ def _build_json_directive_7(
     if include_camera_framing: enabled.append("camera_framing")
 
     enabled_csv = ", ".join(enabled) if enabled else "none"
-
     schema = _empty_fields_dict()
 
     return (
@@ -153,6 +182,18 @@ def _build_json_directive_7(
         "- Do NOT infer or invent details; if unsure, omit the field.\n"
         "- Output the JSON on a single line with no extra whitespace.\n"
     )
+
+def _combine_sections_sentence(fields: dict, order: list) -> str:
+    parts = []
+    for k in order:
+        v = (fields.get(k, "") or "").strip()
+        if not v:
+            continue
+        # ensure each chunk ends with a period for readability
+        if v[-1] not in ".!?":
+            v = v + "."
+        parts.append(v)
+    return " ".join(parts).strip()
 
 def _safe_parse_json_object(text: str) -> dict:
     if not isinstance(text, str):
@@ -182,7 +223,8 @@ def _safe_parse_json_object(text: str) -> dict:
 
 def _guard_and_blank_fields(
     obj: dict,
-    include_subject_scene: bool,
+    include_subject: bool,
+    include_scene: bool,
     include_style: bool,
     include_clothing_accessories: bool,
     include_pose_orientation: bool,
@@ -197,7 +239,8 @@ def _guard_and_blank_fields(
             v = obj.get(k, "")
             out[k] = v if isinstance(v, str) else ""
 
-    if not include_subject_scene: out["subject_scene"] = ""
+    if not include_subject: out["subject"] = ""
+    if not include_scene: out["scene"] = ""
     if not include_style: out["style"] = ""
     if not include_clothing_accessories: out["clothing_accessories"] = ""
     if not include_pose_orientation: out["pose_orientation"] = ""
@@ -209,7 +252,7 @@ def _guard_and_blank_fields(
 
 
 def _parse_section_order(order: str) -> list:
-    allowed = set(SECTION_KEYS)
+    allowed = set(SECTION_KEYS) | set(MISC_KEYS)
     seen = set()
     out = []
     for part in (order or "").split(","):
@@ -224,10 +267,17 @@ def _parse_section_order(order: str) -> list:
     return out if out else list(SECTION_KEYS)
 
 
-def _combine_sections(fields: dict, order: list) -> str:
+def _combine_sections(fields: dict, order: list, misc1: str, misc2: str) -> str:
+    misc_map = {
+        "misc1": (misc1 or "").strip(),
+        "misc2": (misc2 or "").strip(),
+    }
     parts = []
     for k in order:
-        v = (fields.get(k, "") or "").strip()
+        if k in misc_map:
+            v = misc_map[k]
+        else:
+            v = (fields.get(k, "") or "").strip()
         if v:
             parts.append(v)
     return ", ".join(parts)
@@ -240,8 +290,8 @@ class APIPromptExtractorSDXL:
     """
 
     CATEGORY = "API Prompt Extractor"
-    RETURN_TYPES = ("STRING",)
-    RETURN_NAMES = ("prompt",)
+    RETURN_TYPES = ("STRING", "STRING")
+    RETURN_NAMES = ("prompt", "negative")
     FUNCTION = "run"
 
     @classmethod
@@ -250,47 +300,88 @@ class APIPromptExtractorSDXL:
             "required": {
                 "image": ("IMAGE",),
                 "llm_model": ("STRING", {"default": "gpt-5-mini"}),
-                "max_output_tokens": ("INT", {"default": 512, "min": 32, "max": 2048}),
+                "rules_file": (_list_rule_files(), {"default": "sdxl_prompt_instructions.txt"}),
+                "max_output_tokens": ("INT", {"default": 2048, "min": 32, "max": 5096}),
                 "jpeg_quality": ("INT", {"default": 90, "min": 30, "max": 95}),
-
+                "combine_mode": (["section_order", "simplified_juggernaut", "sentence_chunks"], {"default": "section_order"}),
                 # Section toggles (match SECTION_KEYS exactly)
-                "include_subject_scene": ("BOOLEAN", {"default": True}),
-                "include_style": ("BOOLEAN", {"default": True}),
-                "include_clothing_accessories": ("BOOLEAN", {"default": True}),
-                "include_pose_orientation": ("BOOLEAN", {"default": True}),
-                "include_expression_gaze": ("BOOLEAN", {"default": True}),
-                "include_lighting": ("BOOLEAN", {"default": True}),
-                "include_camera_framing": ("BOOLEAN", {"default": True}),
+                "include_subject": ("BOOLEAN", {"default": True}),
+                "subject_override": ("STRING", {"default": "", "multiline": True}),
 
+                "include_scene": ("BOOLEAN", {"default": True}),
+                "scene_override": ("STRING", {"default": "", "multiline": True}),
+
+
+                "include_style": ("BOOLEAN", {"default": True}),
+                "style_override": ("STRING", {"default": "", "multiline": True}),
+
+                "include_clothing_accessories": ("BOOLEAN", {"default": True}),
+                "clothing_accessories_override": ("STRING", {"default": "", "multiline": True}),
+                "include_pose_orientation": ("BOOLEAN", {"default": True}),
+                "pose_orientation_override": ("STRING", {"default": "", "multiline": True}),
+                "include_expression_gaze": ("BOOLEAN", {"default": True}),
+                "expression_gaze_override": ("STRING", {"default": "", "multiline": True}),
+                "include_lighting": ("BOOLEAN", {"default": True}),
+                "lighting_override": ("STRING", {"default": "", "multiline": True}),
+                "include_camera_framing": ("BOOLEAN", {"default": True}),
+                "camera_framing_override": ("STRING", {"default": "", "multiline": True}),
+                
+                "misc1": ("STRING", {"default": "", "multiline": True}),
+                "misc2": ("STRING", {"default": "", "multiline": True}),
+                 
                 # User-controlled order (CSV, snake_case keys)
                 "section_order": ("STRING", {"default": DEFAULT_SECTION_ORDER}),
             }
         }
     
     def run(
-            self,
-            image,
-            llm_model: str,
-            max_output_tokens: int,
-            jpeg_quality: int,
-            include_subject_scene: bool,
-            include_style: bool,
-            include_clothing_accessories: bool,
-            include_pose_orientation: bool,
-            include_expression_gaze: bool,
-            include_lighting: bool,
-            include_camera_framing: bool,
-            section_order: str,
-    ) -> Tuple[str]:
+        self,
+        image,
+        llm_model: str,
+        rules_file: str,
+        max_output_tokens: int,
+        jpeg_quality: int,
+        combine_mode: str,
+
+        include_subject: bool,
+        subject_override: str,
+
+        include_style: bool,
+        style_override: str,
+
+        include_scene: bool,
+        scene_override: str,
+
+        include_clothing_accessories: bool,
+        clothing_accessories_override: str,
+
+        include_pose_orientation: bool,
+        pose_orientation_override: str,
+
+        include_expression_gaze: bool,
+        expression_gaze_override: str,
+
+        include_lighting: bool,
+        lighting_override: str,  
+
+        include_camera_framing: bool,
+        camera_framing_override: str,
+
+        misc1: str,
+        misc2: str,
+
+        section_order: str,  
+                
+    ) -> Tuple[str, str]:
         # Soft-fail only — never crash the graph
         if OpenAI is None:
             print(f"[APIPromptExtractorSDXL] openai import failed: {_openai_import_error}")
-            return ("",)
+            return ("", "")
 
         api_key = os.getenv("OPENAI_API_KEY", "").strip()
         if not api_key:
             print("[APIPromptExtractorSDXL] OPENAI_API_KEY not set")
-            return ("",)
+            return ("", "")
 
         try:
             b64 = _comfy_image_to_jpeg_base64(image, quality=jpeg_quality)
@@ -298,12 +389,20 @@ class APIPromptExtractorSDXL:
 
             client = OpenAI(api_key=api_key)
 
-            instructions = _load_instructions(INSTRUCTIONS_PATH)
+            rules_path = os.path.join(RULES_DIR, (rules_file or "").strip())
+
+            # basic safety: prevent "../" path tricks
+            if not os.path.abspath(rules_path).startswith(os.path.abspath(RULES_DIR) + os.sep):
+                print(f"[APIPromptExtractorSDXL] Invalid rules_file path: {rules_file}")
+                return ("", "")
+
+            instructions = _load_instructions(rules_path)
             if not instructions:
-                return ("",)
+                return ("", "")
             
-            instructions = instructions + "\n\n" + _build_json_directive_7(
-                include_subject_scene=include_subject_scene,
+            instructions = instructions + "\n\n" + _build_json_directive_8(
+                include_subject=include_subject,
+                include_scene=include_scene,
                 include_style=include_style,
                 include_clothing_accessories=include_clothing_accessories,
                 include_pose_orientation=include_pose_orientation,
@@ -342,17 +441,18 @@ class APIPromptExtractorSDXL:
                     print(response.model_dump())
                 except Exception:
                     print(response)
-                return ("[APIPromptExtractorSDXL] Empty model text output (see console).",)
+                return ("[APIPromptExtractorSDXL] Empty model text output (see console).","")
 
             obj = _safe_parse_json_object(raw)
             if not obj:
                 print("[APIPromptExtractorSDXL] Failed to parse JSON. Raw output follows:")
                 print(repr(raw))
-                return ("[APIPromptExtractorSDXL] Invalid JSON output (see console).",)
+                return ("[APIPromptExtractorSDXL] Invalid JSON output (see console).","")
 
             fields = _guard_and_blank_fields(
                 obj,
-                include_subject_scene=include_subject_scene,
+                include_subject=include_subject,
+                include_scene=include_scene,
                 include_style=include_style,
                 include_clothing_accessories=include_clothing_accessories,
                 include_pose_orientation=include_pose_orientation,
@@ -361,16 +461,52 @@ class APIPromptExtractorSDXL:
                 include_camera_framing=include_camera_framing,
             )
 
-            order = _parse_section_order(section_order)
-            combined = _combine_sections(fields, order)
+            # Apply per-section overrides when toggles are OFF
+            fields["subject"] = _apply_override(include_subject, fields["subject"], subject_override)
+            fields["scene"] = _apply_override(include_scene, fields["scene"], scene_override)
+            fields["style"] = _apply_override(include_style, fields["style"], style_override)
+            fields["clothing_accessories"] = _apply_override(include_clothing_accessories, fields["clothing_accessories"], clothing_accessories_override)
+            fields["pose_orientation"] = _apply_override(include_pose_orientation, fields["pose_orientation"], pose_orientation_override)
+            fields["expression_gaze"] = _apply_override(include_expression_gaze, fields["expression_gaze"], expression_gaze_override)
+            fields["lighting"] = _apply_override(include_lighting, fields["lighting"], lighting_override)
+            fields["camera_framing"] = _apply_override(include_camera_framing, fields["camera_framing"], camera_framing_override)
 
-            return (_normalize_whitespace(combined),)
+            mode = (combine_mode or "").strip().lower()
+
+            if mode == "sentence_chunks":
+                # shove misc into fields so the sentence combiner can see them
+                fields["misc1"] = (misc1 or "").strip()
+                fields["misc2"] = (misc2 or "").strip()
+                combined = _combine_sections_sentence(fields, SENTENCE_CHUNK_ORDER)
+
+            elif mode == "simplified_juggernaut":
+                # simple fixed order but still comma-joined
+                order = [ 
+                    "subject",
+                    "scene",
+                    "lighting",
+                    "camera_framing",
+                    "pose_orientation",
+                    "expression_gaze",
+                    "clothing_accessories",
+                    "style",
+                    "misc1",
+                    "misc2",
+                ]
+                combined = _combine_sections(fields, order, misc1, misc2)
+
+            else:
+                order = _parse_section_order(section_order)
+                combined = _combine_sections(fields, order, misc1, misc2)
+
+            negative = _normalize_whitespace(fields.get("negative", ""))
+            return (_normalize_whitespace(combined), negative)
 
 
 
         except Exception as e:
             print(f"[APIPromptExtractorSDXL] API call failed: {e}")
-            return ("",)
+            return ("", "")
 
 
 NODE_CLASS_MAPPINGS = {
