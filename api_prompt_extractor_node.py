@@ -50,6 +50,67 @@ LLM_PROVIDERS = {
     },
 }
 
+BASE_SECTION_ORDER = [
+    "subject",
+    "scene",
+    "lighting",
+    "camera_framing",
+    "pose_orientation",
+    "expression_gaze",
+    "clothing_accessories",
+    "style",
+]
+
+MISC_POSITION_CHOICES = [
+    "end",
+    "start",
+    "after_subject",
+    "after_scene",
+    "after_lighting",
+    "after_camera_framing",
+    "after_pose_orientation",
+    "after_expression_gaze",
+    "after_clothing_accessories",
+    "after_style",
+]
+
+
+def _insert_misc(order: list, misc_key: str, position: str) -> list:
+    pos = (position or "end").strip().lower()
+    out = [k for k in order if k != misc_key]  # de-dupe
+
+    if pos == "start":
+        return [misc_key] + out
+    if pos == "end":
+        return out + [misc_key]
+
+    if pos.startswith("after_"):
+        anchor = pos.replace("after_", "", 1)
+        if anchor in out:
+            i = out.index(anchor) + 1
+            return out[:i] + [misc_key] + out[i:]
+        # if anchor missing, fall through to end
+
+    return out + [misc_key]
+
+
+def _build_order_with_misc(
+    misc1: str,
+    misc2: str,
+    misc1_position: str,
+    misc2_position: str,
+    base_order: list = None,
+) -> list:
+    order = list(base_order or BASE_SECTION_ORDER)
+
+    if (misc1 or "").strip():
+        order = _insert_misc(order, "misc1", misc1_position)
+
+    if (misc2 or "").strip():
+        order = _insert_misc(order, "misc2", misc2_position)
+
+    return order
+
 
 def _llm_model_choices() -> list:
     choices = []
@@ -388,9 +449,8 @@ class APIPromptExtractorSDXL:
                 
                 "misc1": ("STRING", {"default": "", "multiline": True}),
                 "misc2": ("STRING", {"default": "", "multiline": True}),
-                 
-                # User-controlled order (CSV, snake_case keys)
-                "section_order": ("STRING", {"default": DEFAULT_SECTION_ORDER}),
+                "misc1_position": (MISC_POSITION_CHOICES, {"default": "end"}),
+                "misc2_position": (MISC_POSITION_CHOICES, {"default": "end"}),
             }
         }
     
@@ -429,8 +489,9 @@ class APIPromptExtractorSDXL:
 
         misc1: str,
         misc2: str,
+        misc1_position: str,
+        misc2_position: str,
 
-        section_order: str,  
                 
     ) -> Tuple[str, str]:
         # Soft-fail only — never crash the graph
@@ -581,9 +642,27 @@ class APIPromptExtractorSDXL:
                 ]
                 combined = _combine_sections(fields, order, misc1, misc2)
 
+            mode = (combine_mode or "").strip().lower()
+
+                # Build a single order that always supports misc placement
+            order = _build_order_with_misc(
+                misc1=misc1,
+                misc2=misc2,
+                misc1_position=misc1_position,
+                misc2_position=misc2_position,
+                base_order=BASE_SECTION_ORDER,
+            )
+
+            if mode == "sentence_chunks":                                       
+                # sentence combiner needs misc values in fields
+                fields["misc1"] = (misc1 or "").strip()
+                fields["misc2"] = (misc2 or "").strip()
+                combined = _combine_sections_sentence(fields, order)
+
             else:
-                order = _parse_section_order(section_order)
+                # both "section_order" (now fixed) and "simplified_juggernaut" collapse to comma-join
                 combined = _combine_sections(fields, order, misc1, misc2)
+
 
             negative = _normalize_whitespace(fields.get("negative", ""))
             return (_normalize_whitespace(combined), negative)
