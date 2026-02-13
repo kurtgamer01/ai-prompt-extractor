@@ -6,3 +6,6 @@ output/
 *.safetensors
 *.ckpt
 *.pt
+custom_rules/
+
+# Local-only prompt rules (not tracked)\custom_rules/
