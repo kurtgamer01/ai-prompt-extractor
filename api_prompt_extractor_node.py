@@ -7,7 +7,19 @@ from typing import Tuple
 import numpy as np
 from PIL import Image
 
-RULES_DIR = os.path.join(os.path.dirname(__file__), "rules")
+NODE_DIR = os.path.dirname(__file__)
+
+# Version-controlled rules shipped with the repo
+RULES_DIR = os.path.join(NODE_DIR, "rules")
+
+# Local-only rules (gitignored)
+CUSTOM_RULES_DIR = os.path.join(NODE_DIR, "custom_rules")
+
+# Only these two folders are allowed sources
+ALLOWED_RULE_DIRS = {
+    "rules": RULES_DIR,
+    "custom_rules": CUSTOM_RULES_DIR,
+}
 
 try:
     from openai import OpenAI
@@ -136,17 +148,6 @@ def _parse_llm_model_id(llm_model: str) -> Tuple[str, str]:
 def _get_provider_cfg(provider: str) -> dict:
     return LLM_PROVIDERS.get((provider or "").strip().lower(), {})
 
-def _list_rule_files() -> list:
-    try:
-        files = [
-            f for f in os.listdir(RULES_DIR)
-            if os.path.isfile(os.path.join(RULES_DIR, f)) and f.lower().endswith(".txt")
-        ]
-        files.sort()
-        return files if files else ["sdxl_prompt_instructions.txt"]
-    except Exception as e:
-        print(f"[APIPromptExtractorSDXL] Failed to list rules dir: {e}")
-        return ["sdxl_prompt_instructions.txt"]
 
 def _load_instructions(path: str) -> str:
     try:
@@ -155,6 +156,67 @@ def _load_instructions(path: str) -> str:
     except Exception as e:
         print(f"[APIPromptExtractorSDXL] Failed to load instructions file: {e}")
         return ""
+def _list_rule_files() -> list:
+    """
+    Dropdown entries are repo-relative paths like:
+      - rules/<file>.txt
+      - custom_rules/<file>.txt
+    """
+    out = []
+
+    for rel_dir, abs_dir in ALLOWED_RULE_DIRS.items():
+        try:
+            if not os.path.isdir(abs_dir):
+                continue
+
+            files = [
+                f for f in os.listdir(abs_dir)
+                if os.path.isfile(os.path.join(abs_dir, f)) and f.lower().endswith(".txt")
+            ]
+            files.sort()
+            out.extend([f"{rel_dir}/{f}" for f in files])
+
+        except Exception as e:
+            print(f"[APIPromptExtractorSDXL] Failed to list {rel_dir} dir: {e}")
+
+    if not out:
+        return ["rules/sdxl_prompt_instructions.txt"]
+
+    return out
+
+
+def _resolve_rules_path(rules_file: str) -> str:
+    """
+    Resolve a dropdown value to an absolute file path, constrained to:
+      - rules/
+      - custom_rules/
+    Prevents path traversal and rejects missing/non-txt files.
+    """
+    rel = (rules_file or "").strip().replace("\\", "/")
+    if not rel:
+        return ""
+
+    prefix = rel.split("/", 1)[0].strip()
+    if prefix not in ALLOWED_RULE_DIRS:
+        print(f"[APIPromptExtractorSDXL] Invalid rules prefix: {prefix}")
+        return ""
+
+    abs_path = os.path.abspath(os.path.normpath(os.path.join(NODE_DIR, rel)))
+
+    allowed_root = os.path.abspath(ALLOWED_RULE_DIRS[prefix])
+    if not (abs_path == allowed_root or abs_path.startswith(allowed_root + os.sep)):
+        print(f"[APIPromptExtractorSDXL] Invalid rules path (escape attempt): {rules_file}")
+        return ""
+
+    if not abs_path.lower().endswith(".txt"):
+        print(f"[APIPromptExtractorSDXL] Rules file must be .txt: {rules_file}")
+        return ""
+
+    if not os.path.isfile(abs_path):
+        print(f"[APIPromptExtractorSDXL] Rules file not found: {abs_path}")
+        return ""
+
+    return abs_path
 
 def _comfy_image_to_jpeg_base64(image_tensor, quality: int = 90) -> str:
     """
@@ -245,6 +307,19 @@ SENTENCE_CHUNK_ORDER = [
     "lighting",
     "camera_framing",
     "style",
+    "misc1",
+    "misc2",
+]
+
+Z_IMAGE_TURBO_ORDER = [
+    "subject",
+    "scene",
+    "style",
+    "lighting",
+    "camera_framing",
+    "pose_orientation",
+    "expression_gaze",
+    "clothing_accessories",
     "misc1",
     "misc2",
 ]
@@ -393,15 +468,103 @@ def _combine_sections(fields: dict, order: list, misc1: str, misc2: str) -> str:
         "misc1": (misc1 or "").strip(),
         "misc2": (misc2 or "").strip(),
     }
+
     parts = []
+    sentence_like = False
+
     for k in order:
         if k in misc_map:
             v = misc_map[k]
         else:
             v = (fields.get(k, "") or "").strip()
-        if v:
-            parts.append(v)
-    return ", ".join(parts)
+
+        if not v:
+            continue
+
+        v = v.strip()
+
+        # detect sentence-style chunks
+        if v.endswith((".", "!", "?")):
+            sentence_like = True
+
+        parts.append(v)
+
+    if not parts:
+        return ""
+
+    if sentence_like:
+        # sentence grammar → space join
+        cleaned = [p.rstrip(" ,") for p in parts]
+        return " ".join(cleaned)
+
+    # tag grammar → comma join
+    cleaned = [p.rstrip(" .") for p in parts]
+    return ", ".join(cleaned)
+
+FALLBACK_XAI_MODEL = "grok-4-1-fast-non-reasoning"
+
+def _is_refusal_like(raw: str) -> bool:
+    if not isinstance(raw, str):
+        return True
+    s = raw.strip()
+    if not s:
+        return True
+
+    # If _extract_output_text captured a refusal block
+    if "[REFUSAL]" in s:
+        return True
+
+    # Plain-text refusal phrases sometimes appear
+    lowered = s.lower()
+    if "i can’t assist" in lowered or "i can't assist" in lowered:
+        return True
+
+    # JSON refusal object pattern
+    try:
+        obj = json.loads(s)
+        if isinstance(obj, dict) and ("error" in obj or "refusal" in obj):
+            return True
+    except Exception:
+        pass
+
+    return False
+
+def _make_client_for_provider(provider: str) -> "OpenAI":
+    cfg = _get_provider_cfg(provider)
+    if not cfg:
+        raise RuntimeError(f"UNKNOWN_PROVIDER:{provider}")
+
+    env_key = (cfg.get("env_key") or "").strip()
+    api_key = os.getenv(env_key, "").strip() if env_key else ""
+    if not api_key:
+        raise RuntimeError(f"MISSING_API_KEY:{env_key}")
+
+    base_url_env = (cfg.get("base_url_env") or "").strip()
+    base_url = (os.getenv(base_url_env, "").strip() if base_url_env else "") or (cfg.get("default_base_url") or "").strip()
+
+    if base_url:
+        return OpenAI(api_key=api_key, base_url=base_url)
+    return OpenAI(api_key=api_key)
+
+def _call_and_get_raw(client, req_kwargs: dict) -> str:
+    resp = client.responses.create(**req_kwargs)
+    return _extract_output_text(resp) or ""
+
+def _call_parse_or_raise(client, req_kwargs: dict) -> dict:
+    raw = _call_and_get_raw(client, req_kwargs)
+
+    if _is_refusal_like(raw):
+        raise RuntimeError("MODEL_REFUSAL_OR_EMPTY")
+
+    obj = _safe_parse_json_object(raw)
+    if not obj:
+        raise RuntimeError("INVALID_JSON")
+
+    # Parsed but is actually refusal object
+    if isinstance(obj, dict) and ("error" in obj or "refusal" in obj):
+        raise RuntimeError("REFUSAL_OBJECT")
+
+    return obj
 
 
 class APIPromptExtractorSDXL:
@@ -421,10 +584,10 @@ class APIPromptExtractorSDXL:
             "required": {
                 "image": ("IMAGE",),
                 "llm_model": (_llm_model_choices(), {"default": "openai:gpt-5-mini"}),
-                "rules_file": (_list_rule_files(), {"default": "sdxl_prompt_instructions.txt"}),
+                "rules_file": (_list_rule_files(), {"default": "rules/sdxl_prompt_instructions.txt"}),
                 "max_output_tokens": ("INT", {"default": 2048, "min": 32, "max": 5096}),
                 "jpeg_quality": ("INT", {"default": 90, "min": 30, "max": 95}),
-                "combine_mode": (["section_order", "simplified_juggernaut", "sentence_chunks"], {"default": "section_order"}),
+                "combine_mode": (["section_order", "simplified_juggernaut", "sentence_chunks","z-image-turbo",], {"default": "section_order"}),
                 # Section toggles (match SECTION_KEYS exactly)
                 "include_subject": ("BOOLEAN", {"default": True}),
                 "subject_override": ("STRING", {"default": "", "multiline": True}),
@@ -531,11 +694,8 @@ class APIPromptExtractorSDXL:
                 client = OpenAI(api_key=api_key)
 
 
-            rules_path = os.path.join(RULES_DIR, (rules_file or "").strip())
-
-            # basic safety: prevent "../" path tricks
-            if not os.path.abspath(rules_path).startswith(os.path.abspath(RULES_DIR) + os.sep):
-                print(f"[APIPromptExtractorSDXL] Invalid rules_file path: {rules_file}")
+            rules_path = _resolve_rules_path(rules_file)
+            if not rules_path:
                 return ("", "")
 
             instructions = _load_instructions(rules_path)
@@ -573,28 +733,34 @@ class APIPromptExtractorSDXL:
             if provider == "openai":
                 req_kwargs["reasoning"] = {"effort": "low"}
 
-            response = client.responses.create(**req_kwargs)
+            def build_req_kwargs(for_provider: str, for_model: str) -> dict:
+                rk = dict(req_kwargs)
+                rk["model"] = for_model
 
+                # Only OpenAI gets reasoning
+                if for_provider != "openai":
+                    rk.pop("reasoning", None)
+
+                return rk
+
+            # 1) Try primary once
             try:
-                print("[APIPromptExtractorSDXL] output_text:", repr(getattr(response, "output_text", None)))
-                #print("[APIPromptExtractorSDXL] output:", getattr(response, "output", None))
-            except Exception as _:
-                pass
+                obj = _call_parse_or_raise(client, build_req_kwargs(provider, model_name))
+            except Exception as e_primary:
+                print(f"[APIPromptExtractorSDXL] Primary provider failed/refused: {e_primary}")
 
-            raw = _extract_output_text(response)
-            if not raw:
-                print("[APIPromptExtractorSDXL] EMPTY TEXT OUTPUT. Full response dump follows:")
+                # 2) Immediate fallback to xAI Grok
                 try:
-                    print(response.model_dump())
-                except Exception:
-                    print(response)
-                return ("[APIPromptExtractorSDXL] Empty model text output (see console).","")
-
-            obj = _safe_parse_json_object(raw)
-            if not obj:
-                print("[APIPromptExtractorSDXL] Failed to parse JSON. Raw output follows:")
-                print(repr(raw))
-                return ("[APIPromptExtractorSDXL] Invalid JSON output (see console).","")
+                    xclient = _make_client_for_provider("xai")
+                    obj = _call_parse_or_raise(
+                        xclient,
+                        build_req_kwargs("xai", FALLBACK_XAI_MODEL)
+                    )
+                    print("[APIPromptExtractorSDXL] Fallback to xAI succeeded.")
+                except Exception as e_fallback:
+                    print(f"[APIPromptExtractorSDXL] Fallback to xAI failed: {e_fallback}")
+                    return ("[APIPromptExtractorSDXL] Extraction failed after fallback (see console).", "")
+           
 
             fields = _guard_and_blank_fields(
                 obj,
@@ -620,15 +786,13 @@ class APIPromptExtractorSDXL:
 
             mode = (combine_mode or "").strip().lower()
 
+            # pick the base order per mode (WITHOUT assuming misc is at end)
             if mode == "sentence_chunks":
-                # shove misc into fields so the sentence combiner can see them
-                fields["misc1"] = (misc1 or "").strip()
-                fields["misc2"] = (misc2 or "").strip()
-                combined = _combine_sections_sentence(fields, SENTENCE_CHUNK_ORDER)
-
+                base = SENTENCE_CHUNK_ORDER
+            elif mode == "z-image-turbo":
+                base = Z_IMAGE_TURBO_ORDER
             elif mode == "simplified_juggernaut":
-                # simple fixed order but still comma-joined
-                order = [ 
+                base = [
                     "subject",
                     "scene",
                     "lighting",
@@ -637,33 +801,27 @@ class APIPromptExtractorSDXL:
                     "expression_gaze",
                     "clothing_accessories",
                     "style",
-                    "misc1",
-                    "misc2",
                 ]
-                combined = _combine_sections(fields, order, misc1, misc2)
+            else:
+                base = BASE_SECTION_ORDER
 
-            mode = (combine_mode or "").strip().lower()
-
-                # Build a single order that always supports misc placement
+            # build an order that respects misc placement for the chosen base
             order = _build_order_with_misc(
                 misc1=misc1,
                 misc2=misc2,
                 misc1_position=misc1_position,
                 misc2_position=misc2_position,
-                base_order=BASE_SECTION_ORDER,
+                base_order=base,
             )
 
-            if mode == "sentence_chunks":                                       
-                # sentence combiner needs misc values in fields
+            if mode == "sentence_chunks":
                 fields["misc1"] = (misc1 or "").strip()
                 fields["misc2"] = (misc2 or "").strip()
                 combined = _combine_sections_sentence(fields, order)
-
             else:
-                # both "section_order" (now fixed) and "simplified_juggernaut" collapse to comma-join
                 combined = _combine_sections(fields, order, misc1, misc2)
 
-
+              
             negative = _normalize_whitespace(fields.get("negative", ""))
             return (_normalize_whitespace(combined), negative)
 
